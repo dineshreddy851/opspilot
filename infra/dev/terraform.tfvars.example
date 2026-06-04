@@ -1,0 +1,6 @@
+# Copy this file to terraform.tfvars only when you are ready to test Bedrock.
+# Terraform applies the exact configured model ID to the Lambda environment and
+# grants only bedrock:InvokeModel for that foundation model ARN.
+bedrock_enabled  = true
+bedrock_model_id = "amazon.nova-lite-v1:0"
+

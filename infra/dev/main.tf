@@ -1,6 +1,15 @@
 locals {
-  project_name = "OpsPilot"
-  name_prefix  = "${lower(local.project_name)}-${var.environment}"
+  project_name                = "OpsPilot"
+  name_prefix                 = "${lower(local.project_name)}-${var.environment}"
+  cognito_resource_identifier = "opspilot"
+  bedrock_model_arn = join("", [
+    "arn:",
+    data.aws_partition.current.partition,
+    ":bedrock:",
+    var.aws_region,
+    "::foundation-model/",
+    var.bedrock_model_id,
+  ])
 
   common_tags = {
     Project     = local.project_name
@@ -9,6 +18,8 @@ locals {
     ManagedBy   = "Terraform"
   }
 }
+
+data "aws_partition" "current" {}
 
 data "archive_file" "api" {
   type             = "zip"
@@ -40,6 +51,73 @@ resource "aws_dynamodb_table" "audit" {
 resource "aws_cloudwatch_log_group" "api" {
   name              = "/aws/lambda/${local.name_prefix}-api"
   retention_in_days = 14
+}
+
+resource "aws_cognito_user_pool" "api" {
+  name = "${local.name_prefix}-users"
+
+  username_attributes      = ["email"]
+  auto_verified_attributes = ["email"]
+  mfa_configuration        = "OPTIONAL"
+
+  admin_create_user_config {
+    allow_admin_create_user_only = true
+  }
+
+  password_policy {
+    minimum_length                   = 12
+    require_lowercase                = true
+    require_numbers                  = true
+    require_symbols                  = true
+    require_uppercase                = true
+    temporary_password_validity_days = 7
+  }
+
+  software_token_mfa_configuration {
+    enabled = true
+  }
+}
+
+resource "aws_cognito_resource_server" "api" {
+  identifier = local.cognito_resource_identifier
+  name       = "${local.name_prefix}-api"
+
+  scope {
+    scope_name        = "read"
+    scope_description = "Run approved read-only OpsPilot requests."
+  }
+
+  scope {
+    scope_name        = "apply"
+    scope_description = "Approve controlled OpsPilot changes in a future checkpoint."
+  }
+
+  user_pool_id = aws_cognito_user_pool.api.id
+}
+
+resource "aws_cognito_user_pool_client" "web" {
+  name         = "${local.name_prefix}-web"
+  user_pool_id = aws_cognito_user_pool.api.id
+
+  generate_secret                      = false
+  allowed_oauth_flows_user_pool_client = true
+  allowed_oauth_flows                  = ["code"]
+  allowed_oauth_scopes                 = concat(["openid", "email", "profile"], aws_cognito_resource_server.api.scope_identifiers)
+  callback_urls                        = var.cognito_callback_urls
+  logout_urls                          = var.cognito_logout_urls
+  supported_identity_providers         = ["COGNITO"]
+  prevent_user_existence_errors        = "ENABLED"
+  enable_token_revocation              = true
+  explicit_auth_flows                  = ["ALLOW_REFRESH_TOKEN_AUTH", "ALLOW_USER_SRP_AUTH"]
+  access_token_validity                = 60
+  id_token_validity                    = 60
+  refresh_token_validity               = 30
+
+  token_validity_units {
+    access_token  = "minutes"
+    id_token      = "minutes"
+    refresh_token = "days"
+  }
 }
 
 data "aws_iam_policy_document" "lambda_assume_role" {
@@ -90,6 +168,17 @@ data "aws_iam_policy_document" "lambda" {
     ]
     resources = ["${trimsuffix(aws_cloudwatch_log_group.api.arn, ":*")}:*"]
   }
+
+  dynamic "statement" {
+    for_each = var.bedrock_enabled ? [1] : []
+
+    content {
+      sid       = "InvokeConfiguredBedrockModel"
+      effect    = "Allow"
+      actions   = ["bedrock:InvokeModel"]
+      resources = [local.bedrock_model_arn]
+    }
+  }
 }
 
 resource "aws_iam_role_policy" "lambda" {
@@ -115,6 +204,8 @@ resource "aws_lambda_function" "api" {
   environment {
     variables = {
       AUDIT_TABLE_NAME = aws_dynamodb_table.audit.name
+      BEDROCK_ENABLED  = tostring(var.bedrock_enabled)
+      BEDROCK_MODEL_ID = var.bedrock_model_id
     }
   }
 
@@ -130,6 +221,18 @@ resource "aws_apigatewayv2_api" "api" {
   description   = "HTTP API for the OpsPilot development environment."
 }
 
+resource "aws_apigatewayv2_authorizer" "jwt" {
+  api_id           = aws_apigatewayv2_api.api.id
+  authorizer_type  = "JWT"
+  identity_sources = ["$request.header.Authorization"]
+  name             = "${local.name_prefix}-jwt"
+
+  jwt_configuration {
+    audience = [aws_cognito_user_pool_client.web.id]
+    issuer   = aws_cognito_user_pool.api.endpoint
+  }
+}
+
 resource "aws_apigatewayv2_integration" "api" {
   api_id                 = aws_apigatewayv2_api.api.id
   integration_type       = "AWS_PROXY"
@@ -140,9 +243,19 @@ resource "aws_apigatewayv2_integration" "api" {
 }
 
 resource "aws_apigatewayv2_route" "requests" {
-  api_id    = aws_apigatewayv2_api.api.id
-  route_key = "POST /requests"
-  target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+  api_id               = aws_apigatewayv2_api.api.id
+  route_key            = "POST /requests"
+  target               = "integrations/${aws_apigatewayv2_integration.api.id}"
+  authorization_type   = "JWT"
+  authorizer_id        = aws_apigatewayv2_authorizer.jwt.id
+  authorization_scopes = ["${local.cognito_resource_identifier}/read"]
+}
+
+resource "aws_apigatewayv2_route" "health" {
+  api_id             = aws_apigatewayv2_api.api.id
+  route_key          = "GET /health"
+  target             = "integrations/${aws_apigatewayv2_integration.api.id}"
+  authorization_type = "NONE"
 }
 
 resource "aws_apigatewayv2_stage" "default" {
@@ -157,6 +270,14 @@ resource "aws_lambda_permission" "api_gateway" {
   function_name = aws_lambda_function.api.function_name
   principal     = "apigateway.amazonaws.com"
   source_arn    = "${aws_apigatewayv2_api.api.execution_arn}/*/POST/requests"
+}
+
+resource "aws_lambda_permission" "api_gateway_health" {
+  statement_id  = "AllowApiGatewayHealthInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.api.execution_arn}/*/GET/health"
 }
 
 resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
