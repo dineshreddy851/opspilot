@@ -14,8 +14,9 @@ class TerraformDevelopmentStackTests(unittest.TestCase):
         cls.versions = (INFRA / "versions.tf").read_text(encoding="utf-8")
         cls.variables = (INFRA / "variables.tf").read_text(encoding="utf-8")
         cls.outputs = (INFRA / "outputs.tf").read_text(encoding="utf-8")
+        cls.approval = (INFRA / "approval.tf").read_text(encoding="utf-8")
         cls.all_terraform = "\n".join(
-            (cls.main, cls.versions, cls.variables, cls.outputs)
+            (cls.main, cls.versions, cls.variables, cls.outputs, cls.approval)
         )
 
     def test_required_checkpoint_resources_exist(self):
@@ -134,6 +135,84 @@ class TerraformDevelopmentStackTests(unittest.TestCase):
         self.assertIn('identity_sources = ["$request.header.Authorization"]', authorizer)
         self.assertIn("audience = [aws_cognito_user_pool_client.web.id]", authorizer)
         self.assertIn("issuer   = aws_cognito_user_pool.api.endpoint", authorizer)
+
+    def test_controlled_action_workflow_resources_exist(self):
+        for resource in (
+            'resource "aws_sfn_state_machine" "approval"',
+            'resource "aws_sns_topic" "approvals"',
+            'resource "aws_dynamodb_table" "approvals"',
+            'resource "aws_lambda_function" "approval"',
+            'resource "aws_lambda_function" "mutation"',
+        ):
+            self.assertIn(resource, self.approval)
+
+    def test_standard_workflow_handles_approval_rejection_expiry_and_duplicates(self):
+        self.assertIn('type       = "STANDARD"', self.approval)
+        self.assertIn("lambda:invoke.waitForTaskToken", self.approval)
+        self.assertIn('ErrorEquals = ["States.Timeout"]', self.approval)
+        self.assertIn(
+            "var.approval_workflow_timeout_seconds > var.approval_timeout_seconds",
+            self.approval,
+        )
+        for state in (
+            "IsDuplicate",
+            "DuplicateRequest",
+            "ExecuteControlledAction",
+            "RecordRejected",
+            "RecordExpired",
+        ):
+            self.assertIn(state, self.approval)
+        self.assertRegex(
+            self.approval,
+            r'(?s)StringEquals\s+=\s+"APPROVED".*?Next\s+=\s+"ExecuteControlledAction"',
+        )
+        self.assertRegex(
+            self.approval,
+            r'(?s)StringEquals\s+=\s+"REJECTED".*?Next\s+=\s+"RecordRejected"',
+        )
+
+    def test_mutation_lambda_is_only_called_on_approved_workflow_branch(self):
+        definition = self.approval.split('data "archive_file" "approval"', 1)[0]
+        self.assertEqual(
+            definition.count("FunctionName = aws_lambda_function.mutation.arn"),
+            1,
+        )
+        self.assertRegex(
+            definition,
+            r'(?s)ExecuteControlledAction\s+=\s+\{.*?aws_lambda_function\.mutation\.arn',
+        )
+
+    def test_controlled_action_starts_in_dry_run_mode(self):
+        self.assertRegex(
+            self.variables,
+            r'(?s)variable "controlled_action_dry_run" \{.*?default\s+=\s+true',
+        )
+        self.assertIn(
+            "DRY_RUN                       = tostring(var.controlled_action_dry_run)",
+            self.approval,
+        )
+        mutation_policy = self.approval.split(
+            'data "aws_iam_policy_document" "mutation_lambda" {', 1
+        )[1].split('resource "aws_iam_role_policy" "mutation_lambda"', 1)[0]
+        self.assertIn("for_each = var.controlled_action_dry_run ? [] : [1]", mutation_policy)
+        self.assertIn('actions   = ["ecs:UpdateService"]', mutation_policy)
+
+    def test_orchestrators_have_no_mutating_aws_permissions(self):
+        api_policy = self.main.split(
+            'data "aws_iam_policy_document" "lambda" {', 1
+        )[1].split('resource "aws_iam_role_policy" "lambda"', 1)[0]
+        workflow_policy = self.approval.split(
+            'data "aws_iam_policy_document" "approval_workflow" {', 1
+        )[1].split('resource "aws_iam_role_policy" "approval_workflow"', 1)[0]
+
+        self.assertNotIn("ecs:", api_policy)
+        self.assertNotIn("ecs:", workflow_policy)
+        self.assertEqual(
+            set(re.findall(r'"([a-z0-9]+:[A-Za-z0-9*]+)"', workflow_policy)),
+            {"lambda:InvokeFunction"},
+        )
+        self.assertIn("aws_lambda_function.approval.arn", workflow_policy)
+        self.assertIn("aws_lambda_function.mutation.arn", workflow_policy)
 
 
 if __name__ == "__main__":

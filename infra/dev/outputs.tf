@@ -57,3 +57,33 @@ output "cognito_scopes" {
   description = "Custom OAuth scopes exposed by the OpsPilot resource server."
   value       = aws_cognito_resource_server.api.scope_identifiers
 }
+
+output "approval_state_machine_arn" {
+  description = "Standard Step Functions workflow for controlled-action approvals."
+  value       = aws_sfn_state_machine.approval.arn
+}
+
+output "approval_lambda_name" {
+  description = "Lambda function used to record and decide approval requests."
+  value       = aws_lambda_function.approval.function_name
+}
+
+output "approval_table_name" {
+  description = "DynamoDB table containing controlled-action approval records."
+  value       = aws_dynamodb_table.approvals.name
+}
+
+output "approval_topic_arn" {
+  description = "SNS topic that receives controlled-action approval notifications."
+  value       = aws_sns_topic.approvals.arn
+}
+
+output "mutation_lambda_name" {
+  description = "Dedicated controlled-action Lambda function."
+  value       = aws_lambda_function.mutation.function_name
+}
+
+output "controlled_action_dry_run" {
+  description = "Whether the dedicated mutation Lambda is in dry-run mode."
+  value       = var.controlled_action_dry_run
+}

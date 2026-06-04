@@ -4,3 +4,10 @@
 bedrock_enabled  = true
 bedrock_model_id = "amazon.nova-lite-v1:0"
 
+# Checkpoint 7 publishes approval notifications to this optional email
+# subscription. AWS sends a confirmation email before notifications begin.
+approval_email = "you@example.com"
+
+# Keep the controlled action in dry-run mode until the approval workflow has
+# been reviewed and tested end to end.
+controlled_action_dry_run = true

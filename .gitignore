@@ -8,9 +8,11 @@ __pycache__/
 .terraform/
 *.tfstate
 *.tfstate.*
+*.tfvars
+!*.tfvars.example
 tfplan
 crash.log
-infra/dev/opspilot-api.zip
+infra/dev/*.zip
 build/
 dist/
 *.egg-info/
