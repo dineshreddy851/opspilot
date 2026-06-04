@@ -102,3 +102,23 @@ output "cognito_hosted_ui_domain" {
   description = "Cognito Hosted UI domain used by the web interface."
   value       = "https://${aws_cognito_user_pool_domain.web.domain}.auth.${var.aws_region}.amazoncognito.com"
 }
+
+output "operations_dashboard_name" {
+  description = "CloudWatch dashboard for OpsPilot operational health."
+  value       = aws_cloudwatch_dashboard.operations.dashboard_name
+}
+
+output "operations_alert_topic_arn" {
+  description = "SNS topic receiving OpsPilot operational alarm transitions."
+  value       = aws_sns_topic.operations_alerts.arn
+}
+
+output "cloudtrail_name" {
+  description = "Multi-Region CloudTrail management-event trail."
+  value       = aws_cloudtrail.management.name
+}
+
+output "cloudtrail_bucket_name" {
+  description = "Private S3 bucket containing CloudTrail management-event logs."
+  value       = aws_s3_bucket.cloudtrail.bucket
+}

@@ -332,9 +332,42 @@ Review the generated code before continuing. Confirm that:
 
 ## Run tests
 
+On Linux:
+
+```bash
+cd ~/projects/opspilot
+source .venv/bin/activate
+python -m pip install --editable .
+python -m unittest discover -s tests -p "test_*.py" -v
+```
+
+On Windows PowerShell:
+
 ```powershell
+cd C:\Users\DineshReddySirigiri\Documents\Codex\2026-06-04\i-would-like-to-create-one\outputs\opspilot
+.\.venv\Scripts\Activate.ps1
+python -m pip install --editable .
 python -m unittest discover -s tests -v
 ```
+
+After adding the focused Checkpoint 3 tests, the current project should report:
+
+```text
+Ran 15 tests
+OK
+```
+
+Verify the generated service before committing:
+
+```bash
+grep -R "import boto3" services/api
+grep -R "subprocess\|shell=True\|os.system" services/api || true
+grep -R "put_item\|describe_alarms\|describe_instances" services/api
+test ! -d infra && echo "Correct: Terraform has not been created yet"
+```
+
+The first and third commands must show matches. The second command must show
+nothing. The final command must print the confirmation message.
 
 ## Commit
 
@@ -523,6 +556,25 @@ Do not apply Terraform.
 
 ## Deploy and test
 
+Bedrock is disabled by default. On Linux, review and enable the configured
+foundation model for a plan:
+
+```bash
+cd ~/projects/opspilot/infra/dev
+cp terraform.tfvars.example terraform.tfvars
+terraform fmt -recursive
+terraform validate
+terraform plan -out=tfplan
+terraform show tfplan
+```
+
+The plan should add only `bedrock:InvokeModel` for the configured foundation
+model ARN and update the Lambda code and environment. Do not use a wildcard
+Bedrock permission.
+
+When you are intentionally ready to deploy and incur Bedrock usage charges,
+apply the reviewed plan:
+
 ```powershell
 cd infra\dev
 terraform fmt -recursive
@@ -530,6 +582,9 @@ terraform validate
 terraform plan -out tfplan
 terraform apply tfplan
 ```
+
+For this implementation checkpoint, stop after `terraform plan`; do not run
+`terraform apply`.
 
 Test:
 

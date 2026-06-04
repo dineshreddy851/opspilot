@@ -121,3 +121,19 @@ CloudWatch, CloudTrail, Terraform, and GitHub Actions OIDC.
 - [Use the Linux-specific setup and commands](docs/LINUX_FROM_SCRATCH_GUIDE.md)
 - [Follow the step-by-step AWS roadmap](docs/AWS_PORTFOLIO_ROADMAP.md)
 - [Use the company portfolio demo guide](docs/PORTFOLIO_DEMO.md)
+
+## Company-ready evidence
+
+A reviewer can understand the AWS architecture and its safety boundaries in
+about two minutes by starting with:
+
+- [Architecture and engineering decisions](docs/architecture.md)
+- [Threat model](docs/threat-model.md)
+- [Operations runbook](docs/runbook.md)
+- [Five-minute recording script](docs/demo-script.md)
+- [Cost controls and limitations](docs/cost-controls.md)
+
+The development stack includes Cognito authentication, a deterministic
+read-only policy, a human approval workflow, private web hosting, application
+audit records, a CloudWatch dashboard and alarms, and a multi-Region CloudTrail
+trail. All application resources are declared in `infra/dev`.

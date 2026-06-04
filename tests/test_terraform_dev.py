@@ -16,8 +16,17 @@ class TerraformDevelopmentStackTests(unittest.TestCase):
         cls.outputs = (INFRA / "outputs.tf").read_text(encoding="utf-8")
         cls.approval = (INFRA / "approval.tf").read_text(encoding="utf-8")
         cls.web = (INFRA / "web.tf").read_text(encoding="utf-8")
+        cls.operations = (INFRA / "operations.tf").read_text(encoding="utf-8")
         cls.all_terraform = "\n".join(
-            (cls.main, cls.versions, cls.variables, cls.outputs, cls.approval, cls.web)
+            (
+                cls.main,
+                cls.versions,
+                cls.variables,
+                cls.outputs,
+                cls.approval,
+                cls.web,
+                cls.operations,
+            )
         )
 
     def test_required_checkpoint_resources_exist(self):
@@ -40,7 +49,8 @@ class TerraformDevelopmentStackTests(unittest.TestCase):
         self.assertIn('runtime       = "python3.13"', self.main)
         self.assertRegex(self.main, r'route_key\s+=\s+"POST /requests"')
         self.assertRegex(self.main, r'route_key\s+=\s+"GET /health"')
-        self.assertIn("retention_in_days = 14", self.main)
+        self.assertIn("retention_in_days = var.log_retention_days", self.main)
+        self.assertIn("retention_in_days = var.log_retention_days", self.approval)
         self.assertIn('billing_mode = "PAY_PER_REQUEST"', self.main)
 
     def test_lambda_permissions_are_narrow(self):
@@ -313,6 +323,77 @@ class TerraformDevelopmentStackTests(unittest.TestCase):
         self.assertIn('name            = "requested-by-updated-at-index"', self.approval)
         self.assertIn('attribute_name = "requested_by"', self.approval)
         self.assertIn('key_type       = "RANGE"', self.approval)
+
+    def test_company_ready_observability_resources_exist(self):
+        for resource in (
+            'resource "aws_cloudwatch_dashboard" "operations"',
+            'resource "aws_cloudwatch_metric_alarm" "api_lambda_throttles"',
+            'resource "aws_cloudwatch_metric_alarm" "approval_lambda_errors"',
+            'resource "aws_cloudwatch_metric_alarm" "approval_lambda_throttles"',
+            'resource "aws_cloudwatch_metric_alarm" "mutation_lambda_errors"',
+            'resource "aws_cloudwatch_metric_alarm" "mutation_lambda_throttles"',
+            'resource "aws_cloudwatch_metric_alarm" "api_gateway_5xx"',
+            'resource "aws_sns_topic" "operations_alerts"',
+        ):
+            self.assertIn(resource, self.operations)
+        self.assertIn("aws_sns_topic.operations_alerts.arn", self.operations)
+        self.assertIn("aws_sns_topic.operations_alerts.arn", self.main)
+
+    def test_cloudtrail_is_multi_region_private_and_retained(self):
+        for resource in (
+            'resource "aws_cloudtrail" "management"',
+            'resource "aws_s3_bucket" "cloudtrail"',
+            'resource "aws_s3_bucket_public_access_block" "cloudtrail"',
+            'resource "aws_s3_bucket_lifecycle_configuration" "cloudtrail"',
+            'resource "aws_s3_bucket_policy" "cloudtrail"',
+        ):
+            self.assertIn(resource, self.operations)
+        self.assertIn("is_multi_region_trail         = true", self.operations)
+        self.assertIn("include_global_service_events = true", self.operations)
+        self.assertIn("enable_log_file_validation    = true", self.operations)
+        self.assertIn("include_management_events = true", self.operations)
+        self.assertNotIn("data_resource", self.operations)
+        self.assertIn("days = var.cloudtrail_retention_days", self.operations)
+        self.assertIn("force_destroy = false", self.operations)
+        for setting in (
+            "block_public_acls       = true",
+            "block_public_policy     = true",
+            "ignore_public_acls      = true",
+            "restrict_public_buckets = true",
+        ):
+            self.assertIn(setting, self.operations)
+
+    def test_api_access_logs_have_explicit_retention(self):
+        self.assertIn(
+            'resource "aws_cloudwatch_log_group" "api_access"',
+            self.main,
+        )
+        stage = self.main.split(
+            'resource "aws_apigatewayv2_stage" "default" {', 1
+        )[1].split('resource "aws_lambda_permission" "api_gateway"', 1)[0]
+        self.assertIn("access_log_settings", stage)
+        self.assertIn("aws_cloudwatch_log_group.api_access.arn", stage)
+        self.assertIn(
+            'resource "aws_cloudwatch_log_group" "approval_workflow"',
+            self.approval,
+        )
+        self.assertIn("include_execution_data = false", self.approval)
+        self.assertIn('level                  = "ERROR"', self.approval)
+        self.assertIn(
+            "aws_cloudwatch_log_group.approval_workflow.arn",
+            self.approval,
+        )
+        self.assertIn('variable "log_retention_days"', self.variables)
+        self.assertIn('variable "cloudtrail_retention_days"', self.variables)
+
+    def test_company_ready_outputs_exist(self):
+        for output in (
+            'output "operations_dashboard_name"',
+            'output "operations_alert_topic_arn"',
+            'output "cloudtrail_name"',
+            'output "cloudtrail_bucket_name"',
+        ):
+            self.assertIn(output, self.outputs)
 
 
 if __name__ == "__main__":

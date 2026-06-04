@@ -31,6 +31,37 @@ variable "owner" {
   }
 }
 
+variable "log_retention_days" {
+  description = "Retention in days for application CloudWatch log groups."
+  type        = number
+  default     = 14
+
+  validation {
+    condition = contains(
+      [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653],
+      var.log_retention_days,
+    )
+    error_message = "log_retention_days must be a CloudWatch Logs supported retention value."
+  }
+}
+
+variable "cloudtrail_retention_days" {
+  description = "Days to retain multi-Region CloudTrail management-event logs in S3."
+  type        = number
+  default     = 90
+
+  validation {
+    condition     = var.cloudtrail_retention_days >= 30 && var.cloudtrail_retention_days <= 3650
+    error_message = "cloudtrail_retention_days must be between 30 and 3650."
+  }
+}
+
+variable "operations_alert_email" {
+  description = "Optional email address subscribed to operational CloudWatch alarms."
+  type        = string
+  default     = ""
+}
+
 variable "bedrock_enabled" {
   description = "Enable Amazon Bedrock Converse tool selection with deterministic fallback."
   type        = bool

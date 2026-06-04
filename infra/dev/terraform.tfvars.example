@@ -11,3 +11,8 @@ approval_email = "you@example.com"
 # Keep the controlled action in dry-run mode until the approval workflow has
 # been reviewed and tested end to end.
 controlled_action_dry_run = true
+
+# Optional company-ready operations settings.
+operations_alert_email   = "you@example.com"
+log_retention_days       = 14
+cloudtrail_retention_days = 90

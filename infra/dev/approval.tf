@@ -238,12 +238,17 @@ resource "aws_sns_topic_subscription" "approval_email" {
 
 resource "aws_cloudwatch_log_group" "approval" {
   name              = "/aws/lambda/${local.name_prefix}-approval"
-  retention_in_days = 14
+  retention_in_days = var.log_retention_days
 }
 
 resource "aws_cloudwatch_log_group" "mutation" {
   name              = "/aws/lambda/${local.name_prefix}-mutation"
-  retention_in_days = 14
+  retention_in_days = var.log_retention_days
+}
+
+resource "aws_cloudwatch_log_group" "approval_workflow" {
+  name              = "/aws/vendedlogs/states/${local.name_prefix}-approval"
+  retention_in_days = var.log_retention_days
 }
 
 resource "aws_iam_role" "approval_lambda" {
@@ -427,11 +432,41 @@ resource "aws_iam_role_policy" "approval_workflow" {
   policy = data.aws_iam_policy_document.approval_workflow.json
 }
 
+data "aws_iam_policy_document" "approval_workflow_logs" {
+  statement {
+    sid    = "DeliverWorkflowLogs"
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogDelivery",
+      "logs:GetLogDelivery",
+      "logs:UpdateLogDelivery",
+      "logs:DeleteLogDelivery",
+      "logs:ListLogDeliveries",
+      "logs:PutResourcePolicy",
+      "logs:DescribeResourcePolicies",
+      "logs:DescribeLogGroups",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "approval_workflow_logs" {
+  name   = "${local.name_prefix}-approval-workflow-logs-policy"
+  role   = aws_iam_role.approval_workflow.id
+  policy = data.aws_iam_policy_document.approval_workflow_logs.json
+}
+
 resource "aws_sfn_state_machine" "approval" {
   name       = "${local.name_prefix}-approval"
   role_arn   = aws_iam_role.approval_workflow.arn
   type       = "STANDARD"
   definition = jsonencode(local.approval_workflow_definition)
+
+  logging_configuration {
+    include_execution_data = false
+    level                  = "ERROR"
+    log_destination        = "${aws_cloudwatch_log_group.approval_workflow.arn}:*"
+  }
 
   lifecycle {
     precondition {
@@ -439,4 +474,6 @@ resource "aws_sfn_state_machine" "approval" {
       error_message = "approval_workflow_timeout_seconds must be greater than approval_timeout_seconds so expired requests are recorded."
     }
   }
+
+  depends_on = [aws_iam_role_policy.approval_workflow_logs]
 }

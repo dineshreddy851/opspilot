@@ -76,7 +76,12 @@ resource "aws_dynamodb_table" "audit" {
 
 resource "aws_cloudwatch_log_group" "api" {
   name              = "/aws/lambda/${local.name_prefix}-api"
-  retention_in_days = 14
+  retention_in_days = var.log_retention_days
+}
+
+resource "aws_cloudwatch_log_group" "api_access" {
+  name              = "/aws/apigateway/${local.name_prefix}-api"
+  retention_in_days = var.log_retention_days
 }
 
 resource "aws_cognito_user_pool" "api" {
@@ -351,6 +356,18 @@ resource "aws_apigatewayv2_stage" "default" {
   api_id      = aws_apigatewayv2_api.api.id
   name        = "$default"
   auto_deploy = true
+
+  access_log_settings {
+    destination_arn = aws_cloudwatch_log_group.api_access.arn
+    format = jsonencode({
+      requestId        = "$context.requestId"
+      requestTime      = "$context.requestTime"
+      routeKey         = "$context.routeKey"
+      status           = "$context.status"
+      responseLength   = "$context.responseLength"
+      integrationError = "$context.integrationErrorMessage"
+    })
+  }
 }
 
 resource "aws_lambda_permission" "api_gateway" {
@@ -404,6 +421,8 @@ resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
   period              = 60
   statistic           = "Sum"
   treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.operations_alerts.arn]
+  ok_actions          = [aws_sns_topic.operations_alerts.arn]
 
   dimensions = {
     FunctionName = aws_lambda_function.api.function_name
