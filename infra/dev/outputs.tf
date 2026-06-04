@@ -87,3 +87,18 @@ output "controlled_action_dry_run" {
   description = "Whether the dedicated mutation Lambda is in dry-run mode."
   value       = var.controlled_action_dry_run
 }
+
+output "web_url" {
+  description = "CloudFront URL for the OpsPilot web interface."
+  value       = "https://${aws_cloudfront_distribution.web.domain_name}"
+}
+
+output "web_bucket_name" {
+  description = "Private S3 bucket containing the OpsPilot web interface."
+  value       = aws_s3_bucket.web.bucket
+}
+
+output "cognito_hosted_ui_domain" {
+  description = "Cognito Hosted UI domain used by the web interface."
+  value       = "https://${aws_cognito_user_pool_domain.web.domain}.auth.${var.aws_region}.amazoncognito.com"
+}

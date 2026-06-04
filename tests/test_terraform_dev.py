@@ -15,8 +15,9 @@ class TerraformDevelopmentStackTests(unittest.TestCase):
         cls.variables = (INFRA / "variables.tf").read_text(encoding="utf-8")
         cls.outputs = (INFRA / "outputs.tf").read_text(encoding="utf-8")
         cls.approval = (INFRA / "approval.tf").read_text(encoding="utf-8")
+        cls.web = (INFRA / "web.tf").read_text(encoding="utf-8")
         cls.all_terraform = "\n".join(
-            (cls.main, cls.versions, cls.variables, cls.outputs, cls.approval)
+            (cls.main, cls.versions, cls.variables, cls.outputs, cls.approval, cls.web)
         )
 
     def test_required_checkpoint_resources_exist(self):
@@ -47,9 +48,12 @@ class TerraformDevelopmentStackTests(unittest.TestCase):
             "cloudwatch:DescribeAlarms",
             "ec2:DescribeInstances",
             "dynamodb:PutItem",
+            "dynamodb:GetItem",
+            "dynamodb:Query",
             "logs:CreateLogStream",
             "logs:PutLogEvents",
             "bedrock:InvokeModel",
+            "states:StartExecution",
         }
         lambda_policy = self.main.split(
             'data "aws_iam_policy_document" "lambda" {', 1
@@ -57,6 +61,9 @@ class TerraformDevelopmentStackTests(unittest.TestCase):
         actions = set(re.findall(r'"([a-z0-9]+:[A-Za-z0-9*]+)"', lambda_policy))
         self.assertEqual(actions, expected_actions)
         self.assertIn("resources = [aws_dynamodb_table.audit.arn]", lambda_policy)
+        self.assertIn("actor-subject-timestamp-index", lambda_policy)
+        self.assertIn("requested-by-updated-at-index", lambda_policy)
+        self.assertIn("resources = [aws_sfn_state_machine.approval.arn]", lambda_policy)
         self.assertIn("aws_cloudwatch_log_group.api.arn", lambda_policy)
         self.assertIn("resources = [local.bedrock_model_arn]", lambda_policy)
         self.assertNotIn("bedrock:InvokeModelWithResponseStream", lambda_policy)
@@ -213,6 +220,99 @@ class TerraformDevelopmentStackTests(unittest.TestCase):
         )
         self.assertIn("aws_lambda_function.approval.arn", workflow_policy)
         self.assertIn("aws_lambda_function.mutation.arn", workflow_policy)
+
+    def test_web_interface_uses_private_s3_and_cloudfront_oac(self):
+        for resource in (
+            'resource "aws_s3_bucket" "web"',
+            'resource "aws_s3_bucket_public_access_block" "web"',
+            'resource "aws_cloudfront_origin_access_control" "web"',
+            'resource "aws_cloudfront_distribution" "web"',
+            'resource "aws_s3_bucket_policy" "web"',
+        ):
+            self.assertIn(resource, self.web)
+        for setting in (
+            "block_public_acls       = true",
+            "block_public_policy     = true",
+            "ignore_public_acls      = true",
+            "restrict_public_buckets = true",
+        ):
+            self.assertIn(setting, self.web)
+        self.assertIn('signing_behavior                  = "always"', self.web)
+        self.assertIn('signing_protocol                  = "sigv4"', self.web)
+        self.assertIn('identifiers = ["cloudfront.amazonaws.com"]', self.web)
+        self.assertIn("values   = [aws_cloudfront_distribution.web.arn]", self.web)
+        self.assertIn("content_security_policy", self.web)
+        self.assertIn("frame-ancestors 'none'", self.web)
+        self.assertNotIn("aws_s3_bucket_website", self.web)
+        self.assertNotRegex(self.web, r'acl\s*=\s*"public-read"')
+
+    def test_web_assets_and_public_runtime_config_are_hosted(self):
+        for resource in (
+            'resource "aws_s3_object" "web_index"',
+            'resource "aws_s3_object" "web_styles"',
+            'resource "aws_s3_object" "web_app"',
+            'resource "aws_s3_object" "web_config"',
+        ):
+            self.assertIn(resource, self.web)
+        self.assertIn('source        = "${local.web_source_dir}/src/main.ts"', self.web)
+        self.assertIn("aws_cognito_user_pool_client.web.id", self.web)
+        self.assertIn('trimsuffix(aws_apigatewayv2_stage.default.invoke_url, "/")', self.web)
+        self.assertNotRegex(
+            self.web.lower(),
+            r"aws_(access|secret)_key|secret_access_key|task_token|tasktoken",
+        )
+
+    def test_cognito_hosted_ui_uses_cloudfront_callback(self):
+        self.assertIn('resource "aws_cognito_user_pool_domain" "web"', self.web)
+        self.assertIn(
+            '"https://${aws_cloudfront_distribution.web.domain_name}/callback"',
+            self.main,
+        )
+        self.assertIn(
+            '"https://${aws_cloudfront_distribution.web.domain_name}"',
+            self.main,
+        )
+        self.assertIn('"${local.cognito_resource_identifier}/apply"', self.web)
+        self.assertIn('"${local.cognito_resource_identifier}/read"', self.web)
+
+    def test_browser_api_routes_have_narrow_cognito_scopes(self):
+        controlled = self.main.split(
+            'resource "aws_apigatewayv2_route" "controlled_requests" {', 1
+        )[1].split('resource "aws_apigatewayv2_route" "timeline"', 1)[0]
+        timeline = self.main.split(
+            'resource "aws_apigatewayv2_route" "timeline" {', 1
+        )[1].split('resource "aws_apigatewayv2_route" "approval_status"', 1)[0]
+        approval_status = self.main.split(
+            'resource "aws_apigatewayv2_route" "approval_status" {', 1
+        )[1].split('resource "aws_apigatewayv2_route" "health"', 1)[0]
+
+        self.assertIn('route_key            = "POST /controlled-requests"', controlled)
+        self.assertIn(
+            'authorization_scopes = ["${local.cognito_resource_identifier}/apply"]',
+            controlled,
+        )
+        self.assertIn('route_key            = "GET /timeline"', timeline)
+        self.assertIn(
+            'authorization_scopes = ["${local.cognito_resource_identifier}/read"]',
+            timeline,
+        )
+        self.assertIn('route_key            = "GET /approvals/{request_id}"', approval_status)
+        self.assertIn(
+            'authorization_scopes = ["${local.cognito_resource_identifier}/read"]',
+            approval_status,
+        )
+        self.assertIn(
+            'allow_origins = distinct(concat(var.web_allowed_origins, ["https://${aws_cloudfront_distribution.web.domain_name}"]))',
+            self.main,
+        )
+
+    def test_timeline_indexes_are_user_scoped(self):
+        self.assertIn('name            = "actor-subject-timestamp-index"', self.main)
+        self.assertIn('attribute_name = "actor_subject"', self.main)
+        self.assertIn('key_type       = "HASH"', self.main)
+        self.assertIn('name            = "requested-by-updated-at-index"', self.approval)
+        self.assertIn('attribute_name = "requested_by"', self.approval)
+        self.assertIn('key_type       = "RANGE"', self.approval)
 
 
 if __name__ == "__main__":

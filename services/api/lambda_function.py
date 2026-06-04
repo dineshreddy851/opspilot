@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import boto3
+from boto3.dynamodb.conditions import Key
 
 LOGGER = logging.getLogger()
 LOGGER.setLevel(logging.INFO)
@@ -17,8 +18,19 @@ PROJECT_TAG = "OpsPilot"
 SERVICE_NAME = "opspilot-api"
 SERVICE_VERSION = "0.1.0"
 MAX_REQUEST_LENGTH = 1_000
+MAX_TIMELINE_ITEMS = 30
 LIST_CLOUDWATCH_ALARMS = "list_cloudwatch_alarms"
 LIST_OPSPILOT_EC2_INSTANCES = "list_opspilot_ec2_instances"
+CONTROLLED_ACTION = "restart_approved_ecs_service"
+CONTROLLED_REQUESTS = frozenset(
+    {
+        "restart approved ecs service",
+        "restart approved demo ecs service",
+        "restart the approved demo ecs service",
+    }
+)
+AUDIT_ACTOR_INDEX = "actor-subject-timestamp-index"
+APPROVAL_REQUESTER_INDEX = "requested-by-updated-at-index"
 APPROVED_TOOLS = frozenset(
     {
         LIST_CLOUDWATCH_ALARMS,
@@ -156,7 +168,7 @@ def _response(status_code: int, payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _request_from_event(event: dict[str, Any]) -> Any:
+def _body_from_event(event: dict[str, Any]) -> dict[str, Any] | None:
     body = event.get("body", event)
     if isinstance(body, str):
         try:
@@ -164,6 +176,13 @@ def _request_from_event(event: dict[str, Any]) -> Any:
         except json.JSONDecodeError:
             return None
     if not isinstance(body, dict):
+        return None
+    return body
+
+
+def _request_from_event(event: dict[str, Any]) -> Any:
+    body = _body_from_event(event)
+    if body is None:
         return None
     return body.get("request")
 
@@ -190,6 +209,61 @@ def _health_response() -> dict[str, Any]:
             "version": SERVICE_VERSION,
         },
     )
+
+
+def _public_approval_status(status: Any) -> str:
+    normalized = status.upper() if isinstance(status, str) else ""
+    return {
+        "PENDING": "awaiting_approval",
+        "WAITING_APPROVAL": "awaiting_approval",
+        "APPROVED": "approved",
+        "REJECTED": "rejected",
+        "EXPIRED": "expired",
+        "COMPLETED": "completed",
+        "FAILED": "failed",
+        "DUPLICATE": "duplicate",
+    }.get(normalized, "awaiting_approval")
+
+
+def _safe_action_result(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    allowed = {
+        "action",
+        "cluster",
+        "dry_run",
+        "request_id",
+        "service",
+        "service_arn",
+        "status",
+    }
+    return {key: value[key] for key in allowed if key in value}
+
+
+def _safe_approval(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "approval",
+        "request_id": item.get("request_id"),
+        "action": item.get("action"),
+        "status": item.get("status"),
+        "approval_status": _public_approval_status(item.get("status")),
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+        "result": _safe_action_result(item.get("action_result")),
+    }
+
+
+def _safe_audit_event(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "request",
+        "request_id": item.get("request_id"),
+        "timestamp": item.get("timestamp"),
+        "request": item.get("request"),
+        "status": item.get("status"),
+        "reason": item.get("reason"),
+        "tool": item.get("tool"),
+        "risk": item.get("risk", "unknown"),
+    }
 
 
 class AwsApiApplication:
@@ -229,11 +303,13 @@ class AwsApiApplication:
         status_code = 400
         result: dict[str, Any] | None = None
         selection_source = "none"
+        risk = "unknown"
 
         try:
             preflight_refusal = self.policy.preflight(request_text)
             if preflight_refusal:
                 status_code, reason = preflight_refusal
+                risk = "blocked"
             else:
                 proposal, selection_source = self._select_tool(request_text)
                 if proposal is not None:
@@ -241,17 +317,20 @@ class AwsApiApplication:
                     reason = self.policy.validate_proposal(proposal) or ""
                     if reason:
                         status_code = 400
+                        risk = "blocked"
                     else:
                         result = self._execute_tool(tool)
                         status = "succeeded"
                         reason = "approved_read_only_tool"
                         status_code = 200
+                        risk = "read_only"
 
             payload = {
                 "request_id": request_id,
                 "status": status,
                 "reason": reason,
                 "tool": tool,
+                "risk": risk,
                 "selection_source": selection_source,
                 "result": result,
             }
@@ -260,11 +339,13 @@ class AwsApiApplication:
             status = "failed"
             reason = "tool_execution_failed"
             status_code = 500
+            risk = "read_only" if tool else "unknown"
             payload = {
                 "request_id": request_id,
                 "status": status,
                 "reason": reason,
                 "tool": tool,
+                "risk": risk,
                 "selection_source": selection_source,
                 "result": None,
             }
@@ -276,6 +357,7 @@ class AwsApiApplication:
                 reason=reason,
                 status_code=status_code,
                 tool=tool,
+                risk=risk,
                 selection_source=selection_source,
                 actor_subject=actor_subject,
             )
@@ -357,6 +439,7 @@ class AwsApiApplication:
         reason: str,
         status_code: int,
         tool: str | None,
+        risk: str,
         selection_source: str,
         actor_subject: str,
     ) -> None:
@@ -368,6 +451,7 @@ class AwsApiApplication:
             "reason": reason,
             "status_code": status_code,
             "tool": tool or "none",
+            "risk": risk,
             "selection_source": selection_source,
             "actor_subject": actor_subject,
         }
@@ -375,9 +459,128 @@ class AwsApiApplication:
         LOGGER.info(json.dumps({"event": "request_audited", **item}))
 
 
+class WebApiApplication:
+    """Exposes browser-safe workflow status and user-scoped audit data."""
+
+    def __init__(
+        self,
+        audit_table: Any,
+        approval_table: Any,
+        stepfunctions_client: Any | None,
+        approval_state_machine_arn: str,
+    ) -> None:
+        self.audit_table = audit_table
+        self.approval_table = approval_table
+        self.stepfunctions = stepfunctions_client
+        self.approval_state_machine_arn = approval_state_machine_arn
+
+    def start_controlled_request(self, request: Any, subject: str) -> dict[str, Any]:
+        request_text = request.strip() if isinstance(request, str) else ""
+        request_text = request_text[:MAX_REQUEST_LENGTH]
+        normalized = " ".join(request_text.lower().split())
+        if normalized not in CONTROLLED_REQUESTS:
+            return _response(
+                403,
+                {
+                    "status": "refused",
+                    "reason": "controlled_action_not_allowed",
+                    "tool": None,
+                    "risk": "blocked",
+                    "result": None,
+                },
+            )
+        if self.stepfunctions is None or not self.approval_state_machine_arn:
+            raise ValueError("The approval workflow is not configured.")
+
+        request_id = str(uuid.uuid4())
+        status = "awaiting_approval"
+        reason = "human_approval_required"
+        status_code = 202
+        try:
+            self.stepfunctions.start_execution(
+                stateMachineArn=self.approval_state_machine_arn,
+                name=f"request-{request_id}",
+                input=json.dumps(
+                    {
+                        "request_id": request_id,
+                        "action": CONTROLLED_ACTION,
+                        "requested_by": subject,
+                    }
+                ),
+            )
+        except Exception:
+            LOGGER.exception(
+                "Approval workflow failed to start",
+                extra={"request_id": request_id},
+            )
+            status = "failed"
+            reason = "approval_workflow_start_failed"
+            status_code = 500
+
+        self.audit_table.put_item(
+            Item={
+                "request_id": request_id,
+                "timestamp": datetime.now(UTC).isoformat(),
+                "request": request_text,
+                "status": status,
+                "reason": reason,
+                "status_code": status_code,
+                "tool": CONTROLLED_ACTION,
+                "risk": "controlled_mutation",
+                "selection_source": "deterministic",
+                "actor_subject": subject,
+            }
+        )
+        return _response(
+            status_code,
+            {
+                "request_id": request_id,
+                "status": status,
+                "reason": reason,
+                "tool": CONTROLLED_ACTION,
+                "risk": "controlled_mutation",
+                "approval_status": status,
+                "result": None,
+            },
+        )
+
+    def approval_status(self, request_id: Any, subject: str) -> dict[str, Any]:
+        if not isinstance(request_id, str) or not request_id.strip():
+            return _response(400, {"status": "refused", "reason": "request_id_required"})
+        item = self.approval_table.get_item(
+            Key={"request_id": request_id.strip()},
+            ConsistentRead=True,
+        ).get("Item")
+        if not item or item.get("requested_by") != subject:
+            return _response(404, {"status": "not_found", "reason": "approval_not_found"})
+        return _response(200, _safe_approval(item))
+
+    def timeline(self, subject: str) -> dict[str, Any]:
+        audit_items = self.audit_table.query(
+            IndexName=AUDIT_ACTOR_INDEX,
+            KeyConditionExpression=Key("actor_subject").eq(subject),
+            ScanIndexForward=False,
+            Limit=MAX_TIMELINE_ITEMS,
+        ).get("Items", [])
+        approval_items = self.approval_table.query(
+            IndexName=APPROVAL_REQUESTER_INDEX,
+            KeyConditionExpression=Key("requested_by").eq(subject),
+            ScanIndexForward=False,
+            Limit=MAX_TIMELINE_ITEMS,
+        ).get("Items", [])
+        events = [_safe_audit_event(item) for item in audit_items]
+        events.extend(_safe_approval(item) for item in approval_items)
+        events.sort(
+            key=lambda item: item.get("timestamp") or item.get("updated_at") or "",
+            reverse=True,
+        )
+        return _response(200, {"events": events[:MAX_TIMELINE_ITEMS]})
+
+
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """API Gateway Lambda entry point."""
-    if event.get("routeKey") == "GET /health":
+    route_key = event.get("routeKey")
+    if route_key == "GET /health":
         return _health_response()
 
     subject = _subject_from_event(event)
@@ -390,12 +593,45 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             },
         )
 
-    table_name = os.environ["AUDIT_TABLE_NAME"]
+    dynamodb = boto3.resource("dynamodb")
+    audit_table = dynamodb.Table(os.environ["AUDIT_TABLE_NAME"])
+
+    if route_key in {
+        "POST /controlled-requests",
+        "GET /timeline",
+        "GET /approvals/{request_id}",
+    }:
+        approval_table = dynamodb.Table(os.environ["APPROVAL_TABLE_NAME"])
+        web_application = WebApiApplication(
+            audit_table=audit_table,
+            approval_table=approval_table,
+            stepfunctions_client=(
+                boto3.client("stepfunctions")
+                if route_key == "POST /controlled-requests"
+                else None
+            ),
+            approval_state_machine_arn=os.getenv("APPROVAL_STATE_MACHINE_ARN", ""),
+        )
+        if route_key == "POST /controlled-requests":
+            return web_application.start_controlled_request(
+                _request_from_event(event),
+                subject,
+            )
+        if route_key == "GET /timeline":
+            return web_application.timeline(subject)
+        return web_application.approval_status(
+            event.get("pathParameters", {}).get("request_id"),
+            subject,
+        )
+
+    if route_key != "POST /requests":
+        return _response(404, {"status": "not_found", "reason": "route_not_found"})
+
     bedrock_enabled = _env_flag("BEDROCK_ENABLED")
     application = AwsApiApplication(
         cloudwatch_client=boto3.client("cloudwatch"),
         ec2_client=boto3.client("ec2"),
-        audit_table=boto3.resource("dynamodb").Table(table_name),
+        audit_table=audit_table,
         bedrock_client=boto3.client("bedrock-runtime") if bedrock_enabled else None,
         bedrock_enabled=bedrock_enabled,
         bedrock_model_id=os.getenv("BEDROCK_MODEL_ID", ""),

@@ -20,6 +20,7 @@ locals {
 }
 
 data "aws_partition" "current" {}
+data "aws_caller_identity" "current" {}
 
 data "archive_file" "api" {
   type             = "zip"
@@ -37,6 +38,31 @@ resource "aws_dynamodb_table" "audit" {
   attribute {
     name = "request_id"
     type = "S"
+  }
+
+  attribute {
+    name = "actor_subject"
+    type = "S"
+  }
+
+  attribute {
+    name = "timestamp"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "actor-subject-timestamp-index"
+    projection_type = "ALL"
+
+    key_schema {
+      attribute_name = "actor_subject"
+      key_type       = "HASH"
+    }
+
+    key_schema {
+      attribute_name = "timestamp"
+      key_type       = "RANGE"
+    }
   }
 
   point_in_time_recovery {
@@ -103,8 +129,8 @@ resource "aws_cognito_user_pool_client" "web" {
   allowed_oauth_flows_user_pool_client = true
   allowed_oauth_flows                  = ["code"]
   allowed_oauth_scopes                 = concat(["openid", "email", "profile"], aws_cognito_resource_server.api.scope_identifiers)
-  callback_urls                        = var.cognito_callback_urls
-  logout_urls                          = var.cognito_logout_urls
+  callback_urls                        = distinct(concat(var.cognito_callback_urls, ["https://${aws_cloudfront_distribution.web.domain_name}/callback"]))
+  logout_urls                          = distinct(concat(var.cognito_logout_urls, ["https://${aws_cloudfront_distribution.web.domain_name}"]))
   supported_identity_providers         = ["COGNITO"]
   prevent_user_existence_errors        = "ENABLED"
   enable_token_revocation              = true
@@ -160,6 +186,33 @@ data "aws_iam_policy_document" "lambda" {
   }
 
   statement {
+    sid       = "ReadUserAuditTimeline"
+    effect    = "Allow"
+    actions   = ["dynamodb:Query"]
+    resources = ["${aws_dynamodb_table.audit.arn}/index/actor-subject-timestamp-index"]
+  }
+
+  statement {
+    sid    = "ReadUserApprovalStatus"
+    effect = "Allow"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:Query",
+    ]
+    resources = [
+      aws_dynamodb_table.approvals.arn,
+      "${aws_dynamodb_table.approvals.arn}/index/requested-by-updated-at-index",
+    ]
+  }
+
+  statement {
+    sid       = "StartControlledApprovalWorkflow"
+    effect    = "Allow"
+    actions   = ["states:StartExecution"]
+    resources = [aws_sfn_state_machine.approval.arn]
+  }
+
+  statement {
     sid    = "WriteFunctionLogs"
     effect = "Allow"
     actions = [
@@ -203,9 +256,11 @@ resource "aws_lambda_function" "api" {
 
   environment {
     variables = {
-      AUDIT_TABLE_NAME = aws_dynamodb_table.audit.name
-      BEDROCK_ENABLED  = tostring(var.bedrock_enabled)
-      BEDROCK_MODEL_ID = var.bedrock_model_id
+      APPROVAL_STATE_MACHINE_ARN = aws_sfn_state_machine.approval.arn
+      APPROVAL_TABLE_NAME        = aws_dynamodb_table.approvals.name
+      AUDIT_TABLE_NAME           = aws_dynamodb_table.audit.name
+      BEDROCK_ENABLED            = tostring(var.bedrock_enabled)
+      BEDROCK_MODEL_ID           = var.bedrock_model_id
     }
   }
 
@@ -219,6 +274,13 @@ resource "aws_apigatewayv2_api" "api" {
   name          = "${local.name_prefix}-api"
   protocol_type = "HTTP"
   description   = "HTTP API for the OpsPilot development environment."
+
+  cors_configuration {
+    allow_headers = ["authorization", "content-type"]
+    allow_methods = ["GET", "POST", "OPTIONS"]
+    allow_origins = distinct(concat(var.web_allowed_origins, ["https://${aws_cloudfront_distribution.web.domain_name}"]))
+    max_age       = 3600
+  }
 }
 
 resource "aws_apigatewayv2_authorizer" "jwt" {
@@ -245,6 +307,33 @@ resource "aws_apigatewayv2_integration" "api" {
 resource "aws_apigatewayv2_route" "requests" {
   api_id               = aws_apigatewayv2_api.api.id
   route_key            = "POST /requests"
+  target               = "integrations/${aws_apigatewayv2_integration.api.id}"
+  authorization_type   = "JWT"
+  authorizer_id        = aws_apigatewayv2_authorizer.jwt.id
+  authorization_scopes = ["${local.cognito_resource_identifier}/read"]
+}
+
+resource "aws_apigatewayv2_route" "controlled_requests" {
+  api_id               = aws_apigatewayv2_api.api.id
+  route_key            = "POST /controlled-requests"
+  target               = "integrations/${aws_apigatewayv2_integration.api.id}"
+  authorization_type   = "JWT"
+  authorizer_id        = aws_apigatewayv2_authorizer.jwt.id
+  authorization_scopes = ["${local.cognito_resource_identifier}/apply"]
+}
+
+resource "aws_apigatewayv2_route" "timeline" {
+  api_id               = aws_apigatewayv2_api.api.id
+  route_key            = "GET /timeline"
+  target               = "integrations/${aws_apigatewayv2_integration.api.id}"
+  authorization_type   = "JWT"
+  authorizer_id        = aws_apigatewayv2_authorizer.jwt.id
+  authorization_scopes = ["${local.cognito_resource_identifier}/read"]
+}
+
+resource "aws_apigatewayv2_route" "approval_status" {
+  api_id               = aws_apigatewayv2_api.api.id
+  route_key            = "GET /approvals/{request_id}"
   target               = "integrations/${aws_apigatewayv2_integration.api.id}"
   authorization_type   = "JWT"
   authorizer_id        = aws_apigatewayv2_authorizer.jwt.id
@@ -278,6 +367,30 @@ resource "aws_lambda_permission" "api_gateway_health" {
   function_name = aws_lambda_function.api.function_name
   principal     = "apigateway.amazonaws.com"
   source_arn    = "${aws_apigatewayv2_api.api.execution_arn}/*/GET/health"
+}
+
+resource "aws_lambda_permission" "api_gateway_controlled_requests" {
+  statement_id  = "AllowApiGatewayControlledRequests"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.api.execution_arn}/*/POST/controlled-requests"
+}
+
+resource "aws_lambda_permission" "api_gateway_timeline" {
+  statement_id  = "AllowApiGatewayTimeline"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.api.execution_arn}/*/GET/timeline"
+}
+
+resource "aws_lambda_permission" "api_gateway_approval_status" {
+  statement_id  = "AllowApiGatewayApprovalStatus"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.api.execution_arn}/*/GET/approvals/*"
 }
 
 resource "aws_cloudwatch_metric_alarm" "lambda_errors" {

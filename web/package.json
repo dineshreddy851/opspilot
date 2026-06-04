@@ -1,0 +1,13 @@
+{
+  "name": "opspilot-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && node build.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0"
+  }
+}

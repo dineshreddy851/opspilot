@@ -1,0 +1,8 @@
+window.OPSPILOT_CONFIG = {
+  apiUrl: "https://replace-me.execute-api.us-east-1.amazonaws.com",
+  cognitoDomain: "https://replace-me.auth.us-east-1.amazoncognito.com",
+  clientId: "replace-me",
+  redirectUri: "http://localhost:3000/callback",
+  logoutUri: "http://localhost:3000",
+  scopes: ["openid", "email", "profile", "opspilot/read", "opspilot/apply"]
+};

@@ -190,6 +190,31 @@ resource "aws_dynamodb_table" "approvals" {
     type = "S"
   }
 
+  attribute {
+    name = "requested_by"
+    type = "S"
+  }
+
+  attribute {
+    name = "updated_at"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "requested-by-updated-at-index"
+    projection_type = "ALL"
+
+    key_schema {
+      attribute_name = "requested_by"
+      key_type       = "HASH"
+    }
+
+    key_schema {
+      attribute_name = "updated_at"
+      key_type       = "RANGE"
+    }
+  }
+
   point_in_time_recovery {
     enabled = true
   }

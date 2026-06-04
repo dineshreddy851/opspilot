@@ -15,4 +15,5 @@ crash.log
 infra/dev/*.zip
 build/
 dist/
+node_modules/
 *.egg-info/

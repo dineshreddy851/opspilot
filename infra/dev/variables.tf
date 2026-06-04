@@ -70,6 +70,17 @@ variable "cognito_logout_urls" {
   }
 }
 
+variable "web_allowed_origins" {
+  description = "Additional development origins allowed to call the HTTP API."
+  type        = list(string)
+  default     = ["http://localhost:3000"]
+
+  validation {
+    condition     = alltrue([for origin in var.web_allowed_origins : can(regex("^https?://", origin))])
+    error_message = "Every web_allowed_origins entry must begin with http:// or https://."
+  }
+}
+
 variable "approval_email" {
   description = "Optional email address subscribed to controlled-action approval notifications."
   type        = string
